@@ -1,0 +1,55 @@
+name: V2Ray Traffic Worker
+on:
+  workflow_dispatch:
+    inputs:
+      config_link:
+        description: 'V2Ray Config Link'
+        required: true
+      limit_type:
+        description: 'Volume (GB) or Time (Min)'
+        required: true
+      limit_value:
+        description: 'Limit Value'
+        required: true
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      message_id:
+        description: 'Telegram Message ID'
+        required: true
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    # کلید طلایی برای جلوگیری از بن شدن: لیمیت روی ۵ ساعت و ۵۵ دقیقه (۳۵۵ دقیقه)
+    timeout-minutes: 355 
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download Xray-core
+        run: |
+          wget https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip Xray-linux-64.zip -d xray
+          chmod +x xray/xray
+
+      - name: Run Worker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python bot.py --worker \
+            --config "${{ github.event.inputs.config_link }}" \
+            --type "${{ github.event.inputs.limit_type }}" \
+            --value "${{ github.event.inputs.limit_value }}" \
+            --chat "${{ github.event.inputs.chat_id }}" \
+            --msg "${{ github.event.inputs.message_id }}"
