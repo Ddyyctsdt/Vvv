@@ -22,7 +22,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 user_data = {}
 active_sessions = {}
 
-# Background Asyncio Loop for Traffic Generation
+# Background Asyncio Loop for Matrix Engine
 loop = asyncio.new_event_loop()
 
 def start_background_loop(loop):
@@ -32,7 +32,7 @@ def start_background_loop(loop):
 bg_thread = threading.Thread(target=start_background_loop, args=(loop,), daemon=True)
 bg_thread.start()
 
-# ================= Core Logic: Link Parsing & Ping =================
+# ================= Core Logic: Parsing & Ping =================
 def get_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
@@ -107,6 +107,10 @@ def parse_config_link(link):
                     "settings": {"servers": [{"address": host, "port": port, "password": uuid_pass}]},
                     "streamSettings": stream_settings
                 }
+                
+        # Enable Multiplexing (Mux) for maximum performance
+        outbound["mux"] = {"enabled": True, "concurrency": 8}
+        
     except Exception as e:
         print(f"Parsing error: {e}")
         return None, None, None
@@ -124,69 +128,82 @@ def tcp_ping(host, port):
     except Exception:
         return None
 
-# ================= Traffic Generator Engine =================
-class TrafficGenerator:
-    def __init__(self, chat_id, message_id, config_link, limit_type, limit_value):
+# ================= Matrix Engine =================
+class CoreInstance:
+    def __init__(self, core_id):
+        self.core_id = core_id
+        self.port = get_free_port()
+        self.config_file = f"config_core_{self.core_id}_{self.port}.json"
+        self.process = None
+        self.dl_bytes = 0
+        self.ul_bytes = 0
+        self.last_bytes = 0
+
+class MatrixTrafficGenerator:
+    def __init__(self, chat_id, message_id, config_link, limit_type, limit_value, core_count):
         self.chat_id = chat_id
         self.message_id = message_id
         self.config_link = config_link
         self.limit_type = limit_type
         self.limit_value = float(limit_value)
+        self.core_count = int(core_count)
         
-        self.local_port = get_free_port()
-        self.config_file = f"config_{self.local_port}.json"
-        self.xray_process = None
-        
+        self.cores = [CoreInstance(i + 1) for i in range(self.core_count)]
         self.is_running = True
-        self.downloaded_bytes = 0
-        self.uploaded_bytes = 0
         self.start_time = time.time()
-        self.last_bytes = 0
         self.stall_counter = 0
         self.tasks = []
 
-    def start_xray(self):
+    def start_xray_cores(self):
         host, port, outbound = parse_config_link(self.config_link)
         if not outbound:
             return False
 
-        xray_conf = {
-            "log": {"loglevel": "warning"},
-            "inbounds": [{"port": self.local_port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}}],
-            "outbounds": [outbound]
-        }
-        
-        with open(self.config_file, "w") as f:
-            json.dump(xray_conf, f, indent=2)
+        for core in self.cores:
+            xray_conf = {
+                "log": {"loglevel": "error"},
+                "inbounds": [{"port": core.port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}}],
+                "outbounds": [outbound]
+            }
+            with open(core.config_file, "w") as f:
+                json.dump(xray_conf, f, indent=2)
 
-        self.xray_process = subprocess.Popen(["./xray/xray", "-c", self.config_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(3) # Wait for Xray to bind port
+            core.process = subprocess.Popen(
+                ["./xray/xray", "-c", core.config_file],
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
+            )
+        
+        time.sleep(3) # Wait for all Xray cores to bind ports
         return True
 
-    async def _download_task(self):
-        connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{self.local_port}')
+    async def _download_task(self, core):
+        connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{core.port}')
         async with aiohttp.ClientSession(connector=connector) as session:
             while self.is_running:
-                url = f"http://speedtest.tele2.net/100MB.zip?rand={os.urandom(4).hex()}"
+                # 10GB Hetzner file with random query to bypass cache
+                url = f"https://fsn1-speed.hetzner.com/10GB.bin?rand={os.urandom(8).hex()}"
                 try:
-                    async with session.get(url, timeout=30) as response:
+                    async with session.get(url, timeout=60) as response:
                         while self.is_running:
-                            chunk = await response.content.read(65536)
-                            if not chunk: break
-                            self.downloaded_bytes += len(chunk)
+                            # 1MB Chunks
+                            chunk = await response.content.read(1024 * 1024)
+                            if not chunk: 
+                                break
+                            core.dl_bytes += len(chunk)
                 except Exception:
                     await asyncio.sleep(1)
 
-    async def _upload_task(self):
-        dummy_data = os.urandom(1024 * 1024)
-        connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{self.local_port}')
+    async def _upload_task(self, core):
+        dummy_data = os.urandom(1024 * 1024) # 1MB dummy data
+        connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{core.port}')
         async with aiohttp.ClientSession(connector=connector) as session:
             while self.is_running:
                 url = "http://speedtest.tele2.net/upload.php"
                 try:
-                    async with session.post(url, data=dummy_data, timeout=30) as response:
+                    async with session.post(url, data=dummy_data, timeout=60) as response:
                         await response.text()
-                        self.uploaded_bytes += len(dummy_data)
+                        core.ul_bytes += len(dummy_data)
                 except Exception:
                     await asyncio.sleep(1)
 
@@ -197,75 +214,119 @@ class TrafficGenerator:
                 break
                 
             elapsed = time.time() - self.start_time
-            total_mb = (self.downloaded_bytes + self.uploaded_bytes) / (1024 * 1024)
-            speed = (self.downloaded_bytes + self.uploaded_bytes - self.last_bytes) / (1024 * 1024) / 3
-            self.last_bytes = self.downloaded_bytes + self.uploaded_bytes
+            
+            total_dl = 0
+            total_ul = 0
+            total_speed = 0
+            
+            core_reports = []
+            
+            for core in self.cores:
+                total_dl += core.dl_bytes
+                total_ul += core.ul_bytes
+                
+                core_speed = (core.dl_bytes + core.ul_bytes - core.last_bytes) / 3 / (1024 * 1024)
+                core.last_bytes = core.dl_bytes + core.ul_bytes
+                total_speed += core_speed
+                
+                core_reports.append(
+                    f"▫️ هسته {core.core_id}: 📥 {core.dl_bytes/(1024**2):.1f}MB | 📤 {core.ul_bytes/(1024**2):.1f}MB | ⚡ {core_speed:.1f} MB/s"
+                )
 
-            if speed < 0.05:
+            total_mb = (total_dl + total_ul) / (1024 * 1024)
+
+            if total_speed < 0.05:
                 self.stall_counter += 3
             else:
                 self.stall_counter = 0
 
-            status_msg = (
-                f"🚀 **عملیات در حال اجرا (All-in-One)**\n\n"
-                f"⏱ زمان سپری شده: `{int(elapsed)} ثانیه`\n"
-                f"📥 دانلود: `{self.downloaded_bytes / (1024**2):.2f} MB`\n"
-                f"📤 آپلود: `{self.uploaded_bytes / (1024**2):.2f} MB`\n"
-                f"⚡ سرعت لحظه‌ای: `{speed:.2f} MB/s`\n"
-                f"🎯 هدف: `{self.limit_value} {self.limit_type}`"
-            )
+            status_msg = f"🟢 **ماتریکس در حال اجرا ({self.core_count} هسته)**\n\n"
+            status_msg += "\n".join(core_reports) + "\n\n"
+            status_msg += "📊 **گزارش کلی:**\n"
+            status_msg += f"⏱ زمان: `{int(elapsed)} ثانیه`\n"
+            status_msg += f"📥 مجموع دانلود: `{total_dl / (1024**2):.2f} MB`\n"
+            status_msg += f"📤 مجموع آپلود: `{total_ul / (1024**2):.2f} MB`\n"
+            status_msg += f"⚡ سرعت کل: `{total_speed:.2f} MB/s`\n"
+            status_msg += f"🎯 هدف: `{self.limit_value} {self.limit_type}`"
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🛑 توقف دستی", callback_data="stop_matrix"))
             
             try:
-                bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=status_msg, parse_mode="Markdown")
+                bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=status_msg, reply_markup=markup, parse_mode="Markdown")
             except Exception:
                 pass
 
+            # Auto-stop conditions
             if self.limit_type == 'GB' and total_mb >= (self.limit_value * 1024):
-                await self.stop("✅ عملیات با موفقیت (رسیدن به حجم هدف) پایان یافت.")
+                await self.stop("✅ مأموریت موفق: رسیدن به حجم هدف")
             elif self.limit_type == 'Min' and elapsed >= (self.limit_value * 60):
-                await self.stop("✅ عملیات با موفقیت (رسیدن به زمان هدف) پایان یافت.")
+                await self.stop("✅ مأموریت موفق: رسیدن به زمان هدف")
             elif self.stall_counter >= 15:
-                await self.stop("❌ توقف خودکار: سرعت برای 15 ثانیه صفر بود (احتمالاً حجم کانفیگ تمام شده است).")
+                await self.stop("❌ قطعی سرور: سرعت برای ۱۵ ثانیه صفر بود")
 
     async def start(self):
-        if not self.start_xray():
+        if not self.start_xray_cores():
             bot.edit_message_text("❌ خطا در پارس کانفیگ یا راه‌اندازی Xray.", chat_id=self.chat_id, message_id=self.message_id)
             if self.chat_id in active_sessions:
                 del active_sessions[self.chat_id]
             return
             
-        self.tasks = [asyncio.create_task(self._download_task()) for _ in range(10)]
-        self.tasks += [asyncio.create_task(self._upload_task()) for _ in range(5)]
+        for core in self.cores:
+            # 5 Download tasks and 2 Upload tasks per core
+            self.tasks += [asyncio.create_task(self._download_task(core)) for _ in range(5)]
+            self.tasks += [asyncio.create_task(self._upload_task(core)) for _ in range(2)]
+            
         self.tasks.append(asyncio.create_task(self._live_reporter()))
-        
         await asyncio.gather(*self.tasks, return_exceptions=True)
 
-    async def stop(self, reason=""):
+    async def stop(self, status_reason="🛑 توقف دستی"):
         if not self.is_running:
             return
         self.is_running = False
         
+        # 1. Cancel Tasks
         for task in self.tasks:
             if not task.done():
                 task.cancel()
                 
-        if self.xray_process:
-            self.xray_process.terminate()
-            self.xray_process.wait()
+        # 2. Terminate Processes & Cleanup Configs
+        total_dl = 0
+        total_ul = 0
+        for core in self.cores:
+            total_dl += core.dl_bytes
+            total_ul += core.ul_bytes
             
-        if os.path.exists(self.config_file):
-            try:
-                os.remove(self.config_file)
-            except Exception:
-                pass
-
-        if reason:
-            try:
-                bot.send_message(self.chat_id, reason)
-                bot.edit_message_text("🛑 عملیات پایان یافت.", chat_id=self.chat_id, message_id=self.message_id)
-            except Exception:
-                pass
+            if core.process:
+                core.process.terminate()
+                core.process.wait()
                 
+            if os.path.exists(core.config_file):
+                try:
+                    os.remove(core.config_file)
+                except Exception:
+                    pass
+
+        # 3. Final Report
+        elapsed = time.time() - self.start_time
+        total_mb = (total_dl + total_ul) / (1024 * 1024)
+        avg_speed = total_mb / elapsed if elapsed > 0 else 0
+        
+        final_msg = (
+            f"📄 **فاکتور نهایی عملیات ماتریکس**\n\n"
+            f"وضعیت: {status_reason}\n"
+            f"تعداد هسته‌ها: `{self.core_count}`\n"
+            f"⏱ زمان کل سپری شده: `{int(elapsed)} ثانیه`\n"
+            f"📦 مجموع دیتای ردوبدل شده: `{total_mb:.2f} MB`\n"
+            f"⚡ میانگین سرعت کل: `{avg_speed:.2f} MB/s`\n"
+        )
+        
+        try:
+            bot.edit_message_text("عملیات پایان یافت.", chat_id=self.chat_id, message_id=self.message_id)
+            bot.send_message(self.chat_id, final_msg, parse_mode="Markdown")
+        except Exception:
+            pass
+            
         if self.chat_id in active_sessions:
             del active_sessions[self.chat_id]
 
@@ -273,14 +334,14 @@ class TrafficGenerator:
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "سلام! به ربات تولید ترافیک یکپارچه خوش آمدید. کانفیگ خود (vmess/vless/trojan) را ارسال کنید.")
+    bot.reply_to(message, "سلام! به ربات تولید ترافیک ماتریکس خوش آمدید. کانفیگ خود (vmess/vless/trojan) را ارسال کنید.")
 
 @bot.message_handler(commands=['stop'])
-def stop_operation(message):
+def stop_cmd(message):
     chat_id = message.chat.id
     if chat_id in active_sessions:
         session = active_sessions[chat_id]
-        asyncio.run_coroutine_threadsafe(session.stop("🛑 عملیات به صورت دستی متوقف شد."), loop)
+        asyncio.run_coroutine_threadsafe(session.stop("🛑 متوقف شده توسط دستور کاربر"), loop)
     else:
         bot.send_message(chat_id, "عملیاتی در حال اجرا نیست.")
 
@@ -289,7 +350,7 @@ def handle_config(message):
     chat_id = message.chat.id
     
     if chat_id in active_sessions:
-        bot.send_message(chat_id, "⚠️ شما در حال حاضر یک عملیات فعال دارید. ابتدا با /stop آن را لغو کنید.")
+        bot.send_message(chat_id, "⚠️ شما در حال حاضر یک ماتریکس فعال دارید. ابتدا با /stop آن را لغو کنید.")
         return
 
     config_link = message.text
@@ -317,11 +378,11 @@ def handle_limit_type(call):
     chat_id = call.message.chat.id
     limit_type = 'GB' if call.data == 'type_vol' else 'Min'
     if chat_id not in user_data:
-        bot.send_message(chat_id, "لطفاً مجدداً کانفیگ را ارسال کنید.")
+        bot.answer_callback_query(call.id, "داده‌ها منقضی شده، مجدداً کانفیگ بفرستید.")
         return
     user_data[chat_id]['limit_type'] = limit_type
     
-    msg = bot.send_message(chat_id, f"مقدار {'حجم (گیگابایت)' if limit_type == 'GB' else 'زمان (دقیقه)'} را وارد کنید:")
+    msg = bot.edit_message_text(f"مقدار {'حجم (گیگابایت)' if limit_type == 'GB' else 'زمان (دقیقه)'} را در چت ارسال کنید:", chat_id, call.message.message_id)
     bot.register_next_step_handler(msg, process_limit_value)
 
 def process_limit_value(message):
@@ -332,17 +393,43 @@ def process_limit_value(message):
         val = float(message.text)
         user_data[chat_id]['limit_value'] = val
         
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🚀 شروع تولید ترافیک", callback_data="start_traffic"))
-        
-        l_type = user_data[chat_id]['limit_type']
-        text = f"**پیش‌فاکتور عملیات**\n\n🔹 سرور: `{user_data[chat_id]['host']}:{user_data[chat_id]['port']}`\n🔹 پینگ: `{user_data[chat_id]['ping']}ms`\n🔹 نوع: `{l_type}`\n🔹 مقدار: `{val}`\n\nبرای شروع مستقیم روی همین سرور کلیک کنید."
-        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+        markup = InlineKeyboardMarkup(row_width=4)
+        markup.add(
+            InlineKeyboardButton("۱ هسته", callback_data="cores_1"),
+            InlineKeyboardButton("۳ هسته", callback_data="cores_3"),
+            InlineKeyboardButton("۵ هسته", callback_data="cores_5"),
+            InlineKeyboardButton("۱۰ هسته", callback_data="cores_10")
+        )
+        bot.send_message(chat_id, "⚙️ قدرت ماتریکس (تعداد موتورهای موازی Xray) را انتخاب کنید:", reply_markup=markup)
     except ValueError:
         bot.send_message(chat_id, "مقدار نامعتبر. دوباره کانفیگ بفرستید.")
 
-@bot.callback_query_handler(func=lambda call: call.data == 'start_traffic')
-def start_traffic_btn(call):
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cores_'))
+def handle_matrix_cores(call):
+    chat_id = call.message.chat.id
+    if chat_id not in user_data:
+        return
+    
+    cores_count = int(call.data.split('_')[1])
+    user_data[chat_id]['cores'] = cores_count
+    
+    data = user_data[chat_id]
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🚀 شروع عملیات ماتریکس", callback_data="start_matrix"))
+    
+    text = (
+        f"**پیش‌فاکتور عملیات ماتریکس**\n\n"
+        f"🔹 سرور: `{data['host']}:{data['port']}`\n"
+        f"🔹 پینگ: `{data['ping']}ms`\n"
+        f"🔹 محدودیت: `{data['limit_value']} {data['limit_type']}`\n"
+        f"🔥 قدرت ماتریکس: `{cores_count} هسته همزمان`\n\n"
+        f"برای شروع عملیات کلیک کنید."
+    )
+    bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == 'start_matrix')
+def start_matrix_btn(call):
     chat_id = call.message.chat.id
     
     if chat_id in active_sessions:
@@ -353,17 +440,28 @@ def start_traffic_btn(call):
     if not data:
         return
         
-    wait_msg = bot.send_message(chat_id, "⏳ در حال استارت هسته Xray و تسک‌های موازی...")
+    wait_msg = bot.edit_message_text("⏳ در حال استارت موتورهای ماتریکس Xray و تسک‌های موازی...", chat_id, call.message.message_id)
     
-    # Initialize Engine Session
-    session = TrafficGenerator(chat_id, wait_msg.message_id, data['config'], data['limit_type'], data['limit_value'])
+    session = MatrixTrafficGenerator(
+        chat_id, wait_msg.message_id, 
+        data['config'], data['limit_type'], data['limit_value'], data['cores']
+    )
     active_sessions[chat_id] = session
     
-    # Push to asyncio background thread without blocking Telebot
     asyncio.run_coroutine_threadsafe(session.start(), loop)
-    bot.answer_callback_query(call.id, "سیستم فعال شد.")
+    bot.answer_callback_query(call.id, "ماتریکس فعال شد.")
+
+@bot.callback_query_handler(func=lambda call: call.data == 'stop_matrix')
+def stop_matrix_btn(call):
+    chat_id = call.message.chat.id
+    if chat_id in active_sessions:
+        bot.answer_callback_query(call.id, "در حال توقف ماتریکس...")
+        session = active_sessions[chat_id]
+        asyncio.run_coroutine_threadsafe(session.stop("🛑 متوقف شده توسط کاربر (دکمه)"), loop)
+    else:
+        bot.answer_callback_query(call.id, "عملیات یافت نشد یا قبلاً متوقف شده است.")
 
 # ================= Entry Point =================
 if __name__ == "__main__":
-    print("Bot is running in ALL-IN-ONE Mode. Waiting for messages...")
+    print("Bot is running in MATRIX All-In-One Mode. Waiting for messages...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
