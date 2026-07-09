@@ -1,4 +1,4 @@
-name: V2Ray Matrix Bot
+name: V2Ray Matrix
 on:
   workflow_dispatch:
 
