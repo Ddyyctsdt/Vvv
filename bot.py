@@ -9,6 +9,7 @@ import base64
 import urllib.parse
 import subprocess
 import threading
+import random
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp_socks import ProxyConnector
 
@@ -179,18 +180,41 @@ class MatrixTrafficGenerator:
 
     async def _download_task(self, core):
         connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{core.port}')
-        async with aiohttp.ClientSession(connector=connector) as session:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive"
+        }
+        
+        target_urls = [
+            "https://speed.cloudflare.com/__down?bytes=1073741824",
+            "http://updates-http.cdn-apple.com/2020/windows/012-34071-20200508-C6926D0A-8F25-11EA-8BA6-24E81CE97D11/AppleX64RecoveryInit.exe",
+            "https://dl.google.com/dl/android/studio/install/2023.2.1.25/android-studio-2023.2.1.25-windows.exe"
+        ]
+        
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=60)
+        
+        async with aiohttp.ClientSession(connector=connector, headers=headers, timeout=timeout) as session:
             while self.is_running:
-                # 10GB Hetzner file with random query to bypass cache
-                url = f"https://fsn1-speed.hetzner.com/10GB.bin?rand={os.urandom(8).hex()}"
+                base_url = random.choice(target_urls)
+                
+                if "cloudflare.com" not in base_url:
+                    sep = "&" if "?" in base_url else "?"
+                    url = f"{base_url}{sep}rand={os.urandom(8).hex()}"
+                else:
+                    url = base_url
+                    
                 try:
-                    async with session.get(url, timeout=60) as response:
-                        while self.is_running:
-                            # 1MB Chunks
-                            chunk = await response.content.read(1024 * 1024)
-                            if not chunk: 
-                                break
-                            core.dl_bytes += len(chunk)
+                    async with session.get(url) as response:
+                        if response.status in [200, 206]:
+                            while self.is_running:
+                                chunk = await response.content.read(2 * 1024 * 1024)
+                                if not chunk: 
+                                    break
+                                core.dl_bytes += len(chunk)
+                        else:
+                            await asyncio.sleep(1)
                 except Exception:
                     await asyncio.sleep(1)
 
