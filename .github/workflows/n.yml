@@ -1,11 +1,21 @@
-name: V2Ray Matrix
+name: V2Ray Matrix Bot
+
 on:
-  workflow_dispatch:
+  schedule:
+    # هر روز در ساعت‌های 00:00, 06:00, 12:00, 18:00 UTC اجرا می‌شود
+    - cron: '0 */6 * * *'
+  workflow_dispatch:  # اجازه اجرای دستی
 
 jobs:
   run-matrix-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 355  # پایان نرم قبل از رسیدن به محدودیت ۶ ساعته مایکروسافت
+
+    # جلوگیری از هم‌پوشانی: اگر اجرای قبلی در حال اتمام بود، اجرای جدید منتظر می‌ماند
+    concurrency:
+      group: v2ray-matrix-runner
+      cancel-in-progress: false
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
